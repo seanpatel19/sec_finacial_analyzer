@@ -35,7 +35,7 @@ The project follows a simple, automated workflow:
 
 Before you begin, ensure you have the following installed and running:
 
-1.  **Python 3.8+**: Check your version with `python3 --version`.
+1.  **Python 3.9+**: Check your version with `python3 --version`.
 2.  **A Locally Running LLM**: This tool does **not** include the LLM itself. You must have an LLM running locally with an accessible API endpoint. Popular options include:
     -   [Ollama](https://ollama.com/) (Recommended for ease of use)
     -   [LM Studio](https://lmstudio.ai/)
@@ -50,12 +50,8 @@ Before you begin, ensure you have the following installed and running:
     cd your-repository-name
     ```
 
-2.  **Create and activate a virtual environment (recommended):**
-    ```bash
-    python3 -m venv venv
-    source venv/bin/activate
-    # On Windows, use: venv\Scripts\activate
-    ```
+2.  **Example Environment provided in .env.example:**
+  
 
 3.  **Install the required Python packages:**
     (First, make sure you have your dependencies listed in a `requirements.txt` file.)
@@ -78,4 +74,4 @@ Once installed and configured, you can run the main script from your terminal.
 *(This is an example. Adjust the command based on your script's name and arguments.)*
 
 ```bash
-python main.py --ticker MSFT --filing "10-K"
+python main.py MSFT --form 10-K
