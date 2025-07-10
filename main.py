@@ -48,7 +48,7 @@ class SECAnalyzer:
         # The new DocumentProcessor is streamlined and doesn't have any arguments.
         self.document_processor = DocumentProcessor()
         self.llm = LLMInterface(self.config.MODEL_NAME)
-        self.summarizer = FinancialSummarizer()
+        self.summarizer = FinancialSummarizer(self.llm, batch_size=3)
         
         logger.info("SEC Financial Analyzer initialized successfully!")
     
@@ -94,6 +94,7 @@ class SECAnalyzer:
             summary_result = self.summarizer.generate_summary(
                 text_to_summarize=processed_data['text_for_summary'], 
                 ticker=ticker
+                form_type=form_type
             )
             
             # Check for summary errors

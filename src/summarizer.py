@@ -1,104 +1,121 @@
 """
-Financial report summarization using a process-isolated, iterative-refine strategy.
-This version performs its own chunking on the fly to avoid creating large lists in memory.
+Financial report summarization using a stable, sequential, and resumable strategy.
+This is the definitive architecture for long-running, local LLM tasks, prioritizing
+reliability and the ability to resume over raw speed.
 """
-# ... (keep imports the same) ...
+
 import logging
 from typing import Dict, List
 import time
-import subprocess
-import sys
+import json
 from pathlib import Path
+
+from .llm_interface import LLMInterface
 from .config import Config
 
 logger = logging.getLogger(__name__)
 
 class FinancialSummarizer:
-    def __init__(self):
+    def __init__(self, llm: LLMInterface):
+        self.llm = llm
         self.config = Config()
-        self.caller_script_path = Path(__file__).parent / "llm_caller.py"
-        logger.info(f"FinancialSummarizer initialized for on-the-fly chunking and process-isolated LLM calls.")
+        logger.info("FinancialSummarizer initialized for stable, resumable processing.")
 
-    # --- CHANGE 1: Update the function signature ---
-    def generate_summary(self, text_to_summarize: str, ticker: str) -> Dict[str, str]:
+    def generate_summary(self, text_to_summarize: str, ticker: str, form_type: str) -> Dict[str, str]:
+        """
+        Generates a summary using a sequential process that saves progress after each chunk.
+        """
         if not text_to_summarize:
             return self._create_error_result("No content to summarize.")
 
-        logger.info(f"Starting summarization for {ticker} on text of length {len(text_to_summarize)}.")
+        logger.info(f"Starting resumable summary for {ticker} ({form_type})...")
         start_time = time.time()
-
-        context_summary = ""
-        final_summary = "No summary could be generated."
-
-        # --- CHANGE 2: On-the-fly chunking loop ---
-        chunk_size = 4000
-        overlap = 400
-        start_index = 0
-        chunk_count = 0
-
-        try:
-            while start_index < len(text_to_summarize):
-                chunk_count += 1
-                end_index = start_index + chunk_size
-                
-                # Get the current chunk by slicing the main text
-                chunk = text_to_summarize[start_index:end_index]
-                
-                logger.info(f"Processing chunk {chunk_count}...")
-                prompt = self._create_refine_prompt(ticker, chunk, context_summary)
-                
-                try:
-                    command = [sys.executable, str(self.caller_script_path), self.config.MODEL_NAME, prompt]
-                    result = subprocess.run(command, capture_output=True, text=True, check=True, encoding='utf-8')
-                    refined_text = result.stdout.strip()
-                except subprocess.CalledProcessError as e:
-                    logger.error(f"LLM caller script failed for chunk {chunk_count}. Error: {e.stderr.strip()}")
-                    start_index += (chunk_size - overlap) # Move to the next chunk even if this one failed
-                    continue
-
-                if refined_text:
-                    context_summary = refined_text
-                    final_summary = context_summary
-                
-                # Move the window for the next chunk
-                start_index += (chunk_size - overlap)
-
-            end_time = time.time()
-            duration = end_time - start_time
-            logger.info(f"Summarization finished in {duration:.2f} seconds.")
-
-            return {
-                'status': 'success', 'summary': final_summary, 'ticker': ticker,
-                'duration_seconds': duration, 'chunks_processed': chunk_count
-            }
         
-        except Exception as e:
-            logger.exception(f"A critical error occurred during summary generation for {ticker}")
-            return self._create_error_result(f"Summary generation failed: {str(e)}")
+        # --- RESUMPTION LOGIC: Define a cache file path for this specific document ---
+        cache_dir = Path(self.config.OUTPUT_DIR) / ticker / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / f"{form_type}_chunk_summaries.json"
+        
+        # --- Load existing summaries if the cache file exists ---
+        chunk_summaries = self._load_cache(cache_file)
+        
+        chunks = self._create_chunks(text_to_summarize)
+        
+        # --- SEQUENTIAL PROCESSING LOOP ---
+        for i, chunk in enumerate(chunks):
+            # --- RESUMPTION CHECK ---
+            if i < len(chunk_summaries):
+                logger.info(f"Skipping chunk {i + 1}/{len(chunks)} (already processed).")
+                continue
 
-    # _create_refine_prompt and _create_error_result remain unchanged
-    # ... (paste your existing helper methods here) ...
+            logger.info(f"Processing chunk {i + 1}/{len(chunks)}...")
+            prompt = self._create_chunk_prompt(chunk, ticker)
+            
+            summary = self.llm.generate(prompt)
+            if "Error:" in summary:
+                logger.error(f"LLM failed on chunk {i + 1}. Aborting run. Re-run to resume. Error: {summary}")
+                return self._create_error_result(f"LLM failed on chunk {i+1}")
 
-    def _create_refine_prompt(self, ticker: str, new_chunk: str, existing_summary: str) -> str:
-        # This function remains unchanged
-        if not existing_summary:
-            return (
-                f"You are a meticulous financial analyst. Your task is to summarize a section of a financial report for the company {ticker}. "
-                "This is the first part of the document. Focus on the key points, financial figures, and strategic insights.\n\n"
-                f"DOCUMENT SECTION:\n---\n{new_chunk}\n---\n\n"
-                "CONCISE SUMMARY OF THIS SECTION:"
-            )
-        else:
-            return (
-                "You are a meticulous financial analyst. You have an existing summary of the previous parts of a financial report. "
-                "Your task is to refine and enrich this summary with new, relevant information from the next section of the document. "
-                "Integrate the new key points into the existing narrative. Do not simply list new facts. "
-                "If the new section is boilerplate or doesn't add value, simply return the 'EXISTING SUMMARY' without changes.\n\n"
-                f"EXISTING SUMMARY:\n---\n{existing_summary}\n---\n\n"
-                f"NEW DOCUMENT SECTION:\n---\n{new_chunk}\n---\n\n"
-                "IMPROVED AND REFINED SUMMARY:"
-            )
+            # --- SAVE PROGRESS IMMEDIATELY ---
+            chunk_summaries.append(summary)
+            self._save_cache(cache_file, chunk_summaries)
+            logger.info(f"Saved progress for chunk {i + 1}.")
+
+        logger.info("All chunks have been summarized. Combining into a final report...")
+        final_summary = self._combine_summaries(chunk_summaries, ticker)
+
+        end_time = time.time()
+        duration = end_time - start_time
+        logger.info(f"Full summary generation finished in {duration:.2f} seconds.")
+
+        # Clean up the cache file after successful completion
+        # cache_file.unlink()
+
+        return {
+            'status': 'success', 'summary': final_summary, 'ticker': ticker,
+            'duration_seconds': duration, 'chunks_processed': len(chunks)
+        }
+
+    def _load_cache(self, cache_file: Path) -> List[str]:
+        """Loads previously summarized chunks from a JSON file."""
+        if cache_file.exists():
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                summaries = json.load(f)
+                logger.info(f"Resuming analysis. Found {len(summaries)} previously completed chunks.")
+                return summaries
+        return []
+
+    def _save_cache(self, cache_file: Path, summaries: List[str]):
+        """Saves the list of chunk summaries to a JSON file."""
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(summaries, f, indent=2)
+
+    def _create_chunks(self, text: str, chunk_size: int = 12000) -> List[str]:
+        return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+    def _create_chunk_prompt(self, chunk: str, ticker: str) -> str:
+        return (
+            f"You are a financial analyst. The following is a small, independent section from a larger financial report for the company {ticker}. "
+            "Provide a concise summary of this specific section, focusing only on the key points, figures, and strategic insights it contains. "
+            "Do not add introductions or conclusions, just summarize the provided text.\n\n"
+            f"DOCUMENT SECTION:\n---\n{chunk}\n---\n\n"
+            "CONCISE SUMMARY OF THIS SECTION:"
+        )
+
+    def _combine_summaries(self, summaries: List[str], ticker: str) -> str:
+        combined_summaries_text = "\n\n---\n\n".join(
+            f"Summary of Part {i+1}:\n{summary}" for i, summary in enumerate(summaries)
+        )
+        prompt = (
+            f"You are a lead financial analyst. You have been given a series of concise summaries from sequential parts of a financial report for {ticker}. "
+            "Your task is to synthesize these individual summaries into a single, well-structured, and coherent final report. "
+            "Identify the main themes, connect the key data points, and present a holistic overview of the company's performance, risks, and outlook based on the provided information. "
+            "Do not just list the summaries; create a flowing narrative.\n\n"
+            f"INDIVIDUAL SUMMARIES:\n---\n{combined_summaries_text}\n---\n\n"
+            "FINAL SYNTHESIZED REPORT:"
+        )
+        final_report = self.llm.generate(prompt, max_tokens=2000)
+        return final_report
 
     def _create_error_result(self, error_msg: str) -> Dict[str, str]:
-        # This function remains unchanged
         return {'summary': f"Error: {error_msg}", 'status': 'error', 'error': error_msg}
