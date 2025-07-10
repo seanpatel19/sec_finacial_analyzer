@@ -1,168 +1,106 @@
 """
-Local LLM interface for text generation
-Handles communication with local language models via Ollama
+Local LLM interface for text generation.
+Handles all communication with a local language model server via the Ollama library,
+using the modern 'chat' completion endpoint for better instruction following.
 """
 
 import logging
 import time
-from typing import Optional, Dict, Any
+from typing import Optional
 
 try:
     import ollama
 except ImportError:
-    raise ImportError("ollama package is required. Install with: pip install ollama")
+    raise ImportError("The 'ollama' package is required. Please install it with: pip install ollama")
 
 logger = logging.getLogger(__name__)
 
 class LLMInterface:
-    """Interface for local LLM communication via Ollama"""
+    """A streamlined interface for local LLM communication via Ollama."""
     
-    def __init__(self, model_name: str = "llama2:13b"):
+    def __init__(self, model_name: str = "llama3"):
         """
-        Initialize LLM interface
-        
+        Initializes the LLM interface and ensures the specified model is available.
+
         Args:
-            model_name: Name of the Ollama model to use
+            model_name: The name of the Ollama model to use (e.g., 'llama3', 'mistral').
         """
         self.model_name = model_name
         
         try:
             self.client = ollama.Client()
+            self._ensure_model_available()
         except Exception as e:
-            logger.error(f"Failed to initialize Ollama client: {e}")
-            raise RuntimeError(f"Could not connect to Ollama service. Make sure Ollama is running. Error: {e}")
+            logger.error(f"Failed to initialize or connect to Ollama client: {e}", exc_info=True)
+            raise RuntimeError(
+                "Could not connect to the Ollama service. "
+                "Please ensure the Ollama application is running on your machine."
+            )
         
-        logger.info(f"Initializing LLM interface with model: {model_name}")
-        self._ensure_model_available()
-        logger.info("LLM interface initialized successfully")
+        logger.info(f"LLMInterface initialized successfully with model: {self.model_name}")
     
     def _ensure_model_available(self):
-        """Check if model is available, download if not"""
+        """
+        Checks if the specified model is available locally. If not, it attempts to download it.
+        This version safely handles different response formats from the ollama library.
+        """
+        logger.info(f"Checking for availability of model: '{self.model_name}'...")
         try:
-            models_response = self.client.list()
+            response = self.client.list()
             
-            # Debug: Print the actual response structure
-            logger.debug(f"Models response structure: {models_response}")
-            
-            # Handle different possible response structures
-            if isinstance(models_response, dict) and 'models' in models_response:
-                models_list = models_response['models']
-            elif isinstance(models_response, list):
-                models_list = models_response
-            else:
-                logger.error(f"Unexpected models response format: {type(models_response)}")
-                raise ValueError(f"Invalid response format from Ollama: {models_response}")
-            
-            # Extract model names with better error handling
-            model_names = []
-            for model in models_list:
-                if isinstance(model, dict):
-                    # Handle dictionary format (older ollama library)
-                    name = model.get('name') or model.get('model') or model.get('id')
-                    if name:
-                        model_names.append(name)
-                    else:
-                        logger.warning(f"Model object missing name field: {model}")
-                elif hasattr(model, 'model'):
-                    # Handle Model objects (newer ollama library)
-                    model_names.append(model.model)
-                elif hasattr(model, 'name'):
-                    # Handle Model objects with 'name' attribute
-                    model_names.append(model.name)
+            # --- FIX: Use a safe method to extract model names ---
+            # The .get() method avoids a KeyError if the key doesn't exist.
+            # This handles variations in the ollama library's response format.
+            installed_models = set()
+            for model_data in response.get('models', []):
+                # Safely get the name, checking for 'name' first, then 'model' as a fallback.
+                name = model_data.get('name') or model_data.get('model')
+                if name:
+                    installed_models.add(name)
                 else:
-                    # Try to convert to string and extract model name
-                    model_str = str(model)
-                    logger.warning(f"Unexpected model format, trying to parse: {model_str}")
-                    # Try to extract model name from string representation
-                    import re
-                    match = re.search(r"model='([^']+)'", model_str)
-                    if match:
-                        model_names.append(match.group(1))
-                    else:
-                        logger.warning(f"Could not extract model name from: {model}")
-            
-            logger.debug(f"Available models: {model_names}")
-            
-            if self.model_name not in model_names:
-                logger.info(f"Model {self.model_name} not found. Downloading...")
-                try:
-                    self.client.pull(self.model_name)
-                    logger.info(f"Model {self.model_name} downloaded successfully!")
-                except Exception as pull_error:
-                    logger.error(f"Failed to download model {self.model_name}: {pull_error}")
-                    raise RuntimeError(f"Could not download model {self.model_name}: {pull_error}")
-            else:
-                logger.info(f"Model {self.model_name} is available")
+                    logger.warning(f"Could not determine name from model data: {model_data}")
+
+            if self.model_name not in installed_models:
+                logger.warning(f"Model '{self.model_name}' not found locally. Attempting to download...")
                 
+                pull_response = self.client.pull(self.model_name, stream=True)
+                for progress in pull_response:
+                    if 'status' in progress:
+                        print(f"\rDownloading model... Status: {progress['status']}", end="")
+                print("\nModel download complete.")
+                
+                logger.info(f"Model '{self.model_name}' downloaded successfully.")
+            else:
+                logger.info(f"Model '{self.model_name}' is available locally.")
+
         except Exception as e:
-            logger.error(f"Error checking model availability: {e}")
-            # Try to continue without model validation as fallback
-            logger.warning("Continuing without model validation - model may not be available")
+            logger.error(f"An error occurred while checking for or pulling the model: {e}")
+            raise ConnectionError(f"Failed to verify model '{self.model_name}' with the Ollama service.")
             
-    def generate(self, prompt: str, temperature: float = 0.3, max_tokens: int = 1000, 
-                 stop_sequences: Optional[list] = None) -> str:
+    def generate(self, prompt: str, temperature: float = 0.2, max_tokens: int = 2000) -> str:
         """
-        Generate text using the local LLM
-        
-        Args:
-            prompt: Input prompt for generation
-            temperature: Sampling temperature (0.0 = deterministic, 1.0 = creative)
-            max_tokens: Maximum number of tokens to generate
-            stop_sequences: List of stop sequences (optional)
-            
-        Returns:
-            str: Generated text response
+        Generates text using the model's chat endpoint for better instruction following.
         """
-        logger.debug(f"Generating text with temperature={temperature}, max_tokens={max_tokens}")
-        
-        # Set default stop sequences if none provided
-        if stop_sequences is None:
-            stop_sequences = ['Human:', 'User:']
+        logger.debug(f"Generating text for a prompt of length {len(prompt)} chars...")
         
         try:
             start_time = time.time()
             
-            response = self.client.generate(
+            response = self.client.chat(
                 model=self.model_name,
-                prompt=prompt,
-                options={
-                    'temperature': temperature,
-                    'num_predict': max_tokens,
-                    'stop': stop_sequences
-                }
+                messages=[{'role': 'user', 'content': prompt}],
+                options={'temperature': temperature, 'num_predict': max_tokens}
             )
             
-            # Validate response structure
-            if not response or 'response' not in response:
-                raise ValueError("Invalid response from model - missing 'response' key")
+            if not response or 'message' not in response or 'content' not in response['message']:
+                raise ValueError("Invalid response structure from Ollama chat endpoint.")
             
             generation_time = time.time() - start_time
-            generated_text = response['response']
+            generated_text = response['message']['content']
             
-            logger.debug(f"Generated {len(generated_text)} characters in {generation_time:.2f} seconds")
-            return generated_text
+            logger.debug(f"Generated {len(generated_text)} characters in {generation_time:.2f} seconds.")
+            return generated_text.strip()
             
         except Exception as e:
-            logger.error(f"Error generating text: {e}")
-            return f"Error generating text: {str(e)}"
-    
-    def generate_with_context(self, system_prompt: str, user_prompt: str, **kwargs) -> str:
-        """
-        Generate text with system and user context
-        
-        Args:
-            system_prompt: System context/instructions
-            user_prompt: User input/question
-            **kwargs: Additional generation parameters
-            
-        Returns:
-            str: Generated response
-        """
-        logger.debug("Generating with system and user context")
-        
-        # Combine system and user prompts
-        full_prompt = f"""System: {system_prompt}
-
-User: {user_prompt}"""
-        
-        return self.generate(full_prompt, **kwargs)
+            logger.error(f"An error occurred during LLM text generation: {e}", exc_info=True)
+            return f"Error: LLM generation failed. Details: {str(e)}"

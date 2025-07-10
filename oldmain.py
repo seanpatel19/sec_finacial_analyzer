@@ -10,7 +10,7 @@ Usage:
 
 Requirements:
     - conda environment: sec_analyzer
-    - Ollama installed with model: e.g., llama3, mistral
+    - Ollama installed with model: llama2:13b
 """
 
 import argparse
@@ -28,7 +28,7 @@ from src.data_collector import SECDataCollector
 from src.document_processor import DocumentProcessor
 from src.llm_interface import LLMInterface
 from src.summarizer import FinancialSummarizer
-from src.config import Config
+from config import Config
 
 # Set up logging
 logging.basicConfig(
@@ -44,11 +44,9 @@ class SECAnalyzer:
         
         self.config = Config()
         self.data_collector = SECDataCollector(self.config)
-        # --- CHANGE 1: Corrected initialization of DocumentProcessor ---
-        # The new DocumentProcessor is streamlined and doesn't have any arguments.
-        self.document_processor = DocumentProcessor()
+        self.document_processor = DocumentProcessor(use_fast_mode=True)  # Enable fast mode for large files
         self.llm = LLMInterface(self.config.MODEL_NAME)
-        self.summarizer = FinancialSummarizer()
+        self.summarizer = FinancialSummarizer(self.llm)
         
         logger.info("SEC Financial Analyzer initialized successfully!")
     
@@ -69,31 +67,24 @@ class SECAnalyzer:
             # Step 1: Download filing
             logger.info("Step 1: Downloading SEC filing...")
             filing_path = self.data_collector.download_latest_filing(ticker, form_type)
-            if not filing_path:
-                raise Exception(f"Failed to download filing for {ticker}.")
             logger.info(f"Downloaded filing: {filing_path}")
             
             # Step 2: Process document
             logger.info("Step 2: Processing document...")
             processed_data = self.document_processor.process_filing(filing_path)
             
-            # --- CHANGE 2: Robust error checking ---
-            # Check the 'error' key in the returned dictionary.
-            if processed_data.get('error'):
+            # Check for processing errors
+            if 'error' in processed_data:
                 raise Exception(f"Document processing failed: {processed_data['error']}")
             
             logger.info("Document processed successfully")
             
             # Step 3: Generate summary
             logger.info("Step 3: Generating AI summary...")
-            
-            # --- CHANGE 3: Updated call to the summarizer ---
-            # We now pass the clean list of text chunks ('chunks_for_summary') to the summarizer.
-            # The financial_data parameter is removed as the new processor focuses on text.
-            # IMPORTANT: You may need to update your FinancialSummarizer class to handle a list of chunks.
             summary_result = self.summarizer.generate_summary(
-                text_to_summarize=processed_data['text_for_summary'], 
-                ticker=ticker
+                processed_data['text'], 
+                processed_data['financial_data'],
+                ticker
             )
             
             # Check for summary errors
@@ -109,9 +100,9 @@ class SECAnalyzer:
             result = {
                 'ticker': ticker,
                 'form_type': form_type,
-                'summary': summary_result['summary'],
-                'summary_metadata': summary_result,
-                # --- CHANGE 4: Removed financial_data from the final result ---
+                'summary': summary_result['summary'],  # Extract the actual summary text
+                'summary_metadata': summary_result,    # Keep full metadata
+                'financial_data': processed_data['financial_data'],
                 'filing_path': filing_path,
                 'success': True
             }
@@ -125,7 +116,7 @@ class SECAnalyzer:
             return result
             
         except Exception as e:
-            logger.error(f"Error analyzing {ticker}: {str(e)}", exc_info=True)
+            logger.error(f"Error analyzing {ticker}: {str(e)}")
             return {
                 'ticker': ticker,
                 'form_type': form_type,
@@ -141,6 +132,7 @@ class SECAnalyzer:
         # Save summary text
         summary_file = output_dir / f"{ticker}_summary.txt"
         with open(summary_file, "w", encoding='utf-8') as f:
+            # Write the actual summary text, not the dictionary
             f.write(summary_result['summary'])
         
         # Save full summary metadata as JSON
@@ -148,14 +140,15 @@ class SECAnalyzer:
         with open(metadata_file, "w", encoding='utf-8') as f:
             json.dump(summary_result, f, indent=2, default=str)
         
-        # --- CHANGE 5: Removed saving of financial_data.csv ---
-        # This part is no longer needed as we focus on text summarization.
+        # Save financial data if available
+        if not data['financial_data'].empty:
+            data_file = output_dir / f"{ticker}_financial_data.csv"
+            data['financial_data'].to_csv(data_file, index=False)
         
         # Save processing info
-        # --- CHANGE 6: Updated keys to match new processor output ---
         processing_info = {
-            'text_length': len(data.get('full_text', '')),
-            'chunks_count': len(data.get('chunks_for_summary', [])),
+            'text_length': len(data.get('text', '')),
+            'chunks_count': len(data.get('chunks', [])),
             'filing_path': str(data.get('filing_path', '')),
             'processing_timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
         }
@@ -198,18 +191,18 @@ Examples:
     args = parser.parse_args()
     
     if args.ui:
+        # Launch Streamlit UI
         logger.info("Launching web interface...")
         import subprocess
         try:
-            # Assumes streamlit_app.py is in a 'ui' subdirectory
-            streamlit_app_path = Path(__file__).parent / "ui" / "streamlit_app.py"
             subprocess.run([
-                sys.executable, "-m", "streamlit", "run", str(streamlit_app_path)
+                sys.executable, "-m", "streamlit", "run", "ui/streamlit_app.py"
             ])
         except KeyboardInterrupt:
             logger.info("Web interface closed by user")
     
     elif args.ticker:
+        # Run analysis
         analyzer = SECAnalyzer()
         result = analyzer.analyze_company(args.ticker.upper(), args.form)
         
@@ -220,11 +213,9 @@ Examples:
             print(result['summary'])
             print("\n" + "="*60)
             print("Analysis completed successfully!")
-            # Use the actual config path for the output directory message
-            output_path = Path(analyzer.config.OUTPUT_DIR) / result['ticker']
-            print(f"Results saved to: {output_path}")
+            print(f"Results saved to: data/summaries/{result['ticker']}/")
         else:
-            print(f"\n[ERROR] Analysis failed: {result['error']}")
+            print(f"Error: {result['error']}")
             sys.exit(1)
     
     else:
